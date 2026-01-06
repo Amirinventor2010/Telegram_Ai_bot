@@ -1,24 +1,32 @@
 services:
   db:
     image: postgres:16
-    container_name: tg-ai-postgres
+    container_name: tg-ai-db
     environment:
-      POSTGRES_USER: telegram_ai_user
-      POSTGRES_PASSWORD: StrongPasswordHere
-      POSTGRES_DB: telegram_ai_bot
+      POSTGRES_DB: ${DB_NAME}
+      POSTGRES_USER: ${DB_USER}
+      POSTGRES_PASSWORD: ${DB_PASSWORD}
     ports:
       - "5432:5432"
     volumes:
       - pgdata:/var/lib/postgresql/data
-    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${DB_USER} -d ${DB_NAME}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
 
   bot:
     build: .
     container_name: tg-ai-bot
+    depends_on:
+      db:
+        condition: service_healthy
     env_file:
       - .env
-    depends_on:
-      - db
+    environment:
+      # مطمئن می‌شیم داخل کانتینر هم دقیقا این ست میشه
+      DATABASE_URL: ${DATABASE_URL}
     restart: unless-stopped
 
 volumes:
