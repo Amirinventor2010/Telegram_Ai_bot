@@ -6,11 +6,10 @@ HOME_KB = ReplyKeyboardMarkup(
         [KeyboardButton("👤 حساب کاربری"), KeyboardButton("🎨 تمپلیت‌ها")],
         [KeyboardButton("🧠 ویرایش تصویر"), KeyboardButton("ℹ️ درباره ما")],
     ],
-    resize_keyboard=True,
+    resize_keyboard=True
 )
 
 
-# -------- User Templates --------
 def templates_inline_kb(items: list[tuple[int, str]]):
     rows = [[InlineKeyboardButton(title, callback_data=f"tpl:view:{tid}")] for tid, title in items]
     rows.append([InlineKeyboardButton("🔙 برگشت", callback_data="tpl:back")])
@@ -24,7 +23,6 @@ def template_preview_kb(template_id: int):
     ])
 
 
-# -------- Admin Templates --------
 def admin_kb():
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("➕ افزودن تمپلیت", callback_data="adm:tpl:add")],
@@ -50,7 +48,6 @@ def admin_template_actions_kb(template_id: int, is_active: bool):
     ])
 
 
-# -------- Edit Flow --------
 def edit_images_kb():
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("✅ تایید عکس‌ها", callback_data="edit:images:confirm")],
@@ -61,7 +58,6 @@ def edit_images_kb():
 
 def edit_prompt_kb():
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("✅ تایید پرامپت", callback_data="edit:prompt:confirm")],
         [InlineKeyboardButton("🔙 لغو", callback_data="edit:cancel")],
     ])
 
@@ -70,4 +66,13 @@ def edit_final_confirm_kb():
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("🚀 شروع پردازش", callback_data="edit:go")],
         [InlineKeyboardButton("🔙 لغو", callback_data="edit:cancel")],
+    ])
+
+
+def account_kb(lang: str):
+    lang_label = "English 🇬🇧" if lang == "fa" else "فارسی 🇮🇷"
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🧾 تاریخچه آخر", callback_data="acc:history")],
+        [InlineKeyboardButton(f"🌐 تغییر زبان به {lang_label}", callback_data="acc:lang:toggle")],
+        [InlineKeyboardButton("🔙 برگشت", callback_data="acc:back")],
     ])

@@ -1,6 +1,7 @@
 import time
 from telegram import Update
 from telegram.ext import ContextTypes
+
 from config import settings
 from config.database import get_session
 from db import repository as repo
@@ -13,7 +14,8 @@ async def ensure_user(update: Update) -> None:
         return
 
     async with get_session() as session:
-        await repo.upsert_user(session, u.id, u.username)
+        user = await repo.upsert_user(session, u.id, u.username)
+        await repo.ensure_daily_reset(session, user)
         await session.commit()
 
 

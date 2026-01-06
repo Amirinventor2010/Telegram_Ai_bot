@@ -1,5 +1,10 @@
+from __future__ import annotations
+
+from datetime import datetime
+
 from telegram import Update
 from telegram.ext import ContextTypes
+
 from config import settings
 from config.database import get_session
 from bot.states import States
@@ -13,6 +18,7 @@ from bot.keyboards import (
     edit_images_kb,
     edit_prompt_kb,
     edit_final_confirm_kb,
+    account_kb,
 )
 from bot.middlewares import (
     ensure_user,
@@ -23,10 +29,32 @@ from bot.middlewares import (
     consume_edit,
 )
 from db import repository as repo
+from services.queue import enqueue_request
 
 
 def _is_admin(uid: int) -> bool:
     return uid in settings.ADMIN_IDS
+
+
+def _ts_to_date(ts: int | None) -> str:
+    if not ts:
+        return "-"
+    return datetime.fromtimestamp(ts).strftime("%Y-%m-%d %H:%M")
+
+
+def _get_photo_file_id(update: Update) -> str | None:
+    msg = update.effective_message
+    if not msg:
+        return None
+
+    if getattr(msg, "photo", None):
+        return msg.photo[-1].file_id
+
+    doc = getattr(msg, "document", None)
+    if doc and (doc.mime_type or "").startswith("image/"):
+        return doc.file_id
+
+    return None
 
 
 # -------------------------
@@ -36,10 +64,10 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await ensure_user(update)
 
     if await is_banned(update):
-        await update.message.reply_text("⛔️ دسترسی شما مسدود شده.")
+        await update.effective_message.reply_text("⛔️ دسترسی شما مسدود شده.")
         return States.HOME
 
-    await update.message.reply_text("سلام! از منو یکی رو انتخاب کن.", reply_markup=HOME_KB)
+    await update.effective_message.reply_text("سلام! از منو یکی رو انتخاب کن.", reply_markup=HOME_KB)
     return States.HOME
 
 
@@ -47,44 +75,69 @@ async def home_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await ensure_user(update)
 
     if await is_banned(update):
-        await update.message.reply_text("⛔️ دسترسی شما مسدود شده.")
+        await update.effective_message.reply_text("⛔️ دسترسی شما مسدود شده.")
         return States.HOME
 
     if not await check_cooldown(update, context):
         return States.HOME
 
-    text = (update.message.text or "").strip()
+    text = (update.effective_message.text or "").strip()
 
     if text == "👤 حساب کاربری":
-        await update.message.reply_text("فعلاً حساب کاربری رو مرحله بعد قشنگ می‌کنیم.", reply_markup=HOME_KB)
-        return States.HOME
+        return await show_account(update, context)
 
     if text == "ℹ️ درباره ما":
-        await update.message.reply_text("این بات برای ویرایش تصویر با هوش مصنوعی ساخته شده.", reply_markup=HOME_KB)
+        await update.effective_message.reply_text("این بات برای ویرایش تصویر با هوش مصنوعی ساخته شده.", reply_markup=HOME_KB)
         return States.HOME
 
     if text == "🎨 تمپلیت‌ها":
         return await show_templates(update, context)
 
     if text == "🧠 ویرایش تصویر":
-        # Gate checks
-        if not await check_force_join(update, context):
+        return await edit_start(update, context)
+
+    await update.effective_message.reply_text("یکی از دکمه‌های منو رو بزن.", reply_markup=HOME_KB)
+    return States.HOME
+
+
+# -------------------------
+# User: Account
+# -------------------------
+async def show_account(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    u = update.effective_user
+    if not u:
+        return States.HOME
+
+    async with get_session() as session:
+        user = await repo.get_user_by_tg(session, u.id)
+        if not user:
+            await update.effective_message.reply_text("یه مشکلی پیش اومد. دوباره /start بزن.", reply_markup=HOME_KB)
             return States.HOME
-        if not await check_daily_quota(update):
-            return States.HOME
 
-        # init flow buffers
-        context.user_data["edit_images"] = []
-        context.user_data["edit_prompt"] = ""
+        await repo.ensure_daily_reset(session, user)
+        total_reqs = await repo.count_requests_for_user(session, u.id)
+        await session.commit()
 
-        await update.message.reply_text(
-            "📸 عکس(ها) رو بفرست. می‌تونی چندتا عکس پشت سر هم ارسال کنی.\n"
-            "وقتی تموم شد روی ✅ تایید عکس‌ها بزن.",
-            reply_markup=edit_images_kb(),
-        )
-        return States.EDIT_WAIT_IMAGES
+        is_vip = bool(user.is_vip)
+        used = int(user.daily_used or 0)
+        free = int(settings.FREE_DAILY_EDITS)
+        remaining = "نامحدود" if is_vip else max(0, free - used)
 
-    await update.message.reply_text("یکی از دکمه‌های منو رو بزن.", reply_markup=HOME_KB)
+        lang = (user.lang or "fa").lower()
+
+    text = (
+        f"👤 حساب کاربری\n\n"
+        f"🆔 ID: {u.id}\n"
+        f"🔖 Username: @{u.username if u.username else '-'}\n"
+        f"💎 VIP: {'✅ فعال' if is_vip else '❌ غیرفعال'}\n"
+        f"📆 سهمیه امروز: {used}/{free} | باقی‌مانده: {remaining}\n"
+        f"📦 تعداد کل درخواست‌ها: {total_reqs}\n"
+        f"🌐 زبان: {lang}\n"
+        f"🕒 اولین ورود: {_ts_to_date(getattr(user, 'first_seen', None))}\n"
+        f"🕒 آخرین فعالیت: {_ts_to_date(getattr(user, 'last_seen', None))}\n"
+    )
+
+    await update.effective_message.reply_text(text, reply_markup=account_kb(lang))
     return States.HOME
 
 
@@ -93,6 +146,9 @@ async def home_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # -------------------------
 async def show_templates(update: Update, context: ContextTypes.DEFAULT_TYPE):
     u = update.effective_user
+    if not u:
+        return States.HOME
+
     async with get_session() as session:
         user = await repo.get_user_by_tg(session, u.id)
         is_vip = bool(user and user.is_vip)
@@ -108,60 +164,94 @@ async def show_templates(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # -------------------------
-# Admin: /admin
+# User: Edit Flow
 # -------------------------
-async def admin_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not update.effective_user or not _is_admin(update.effective_user.id):
-        await update.message.reply_text("ادمین نیستی.")
-        return
-    await update.message.reply_text("پنل ادمین:", reply_markup=admin_kb())
+async def edit_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await check_force_join(update, context):
+        return States.HOME
 
+    if not await check_daily_quota(update):
+        return States.HOME
 
-# -------------------------
-# Edit flow: receive images
-# -------------------------
-async def edit_receive_images(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    file_id = None
-    if update.message.photo:
-        file_id = update.message.photo[-1].file_id
-    elif update.message.document and (update.message.document.mime_type or "").startswith("image/"):
-        file_id = update.message.document.file_id
-    else:
-        await update.message.reply_text("فقط عکس بفرست لطفاً.", reply_markup=edit_images_kb())
-        return States.EDIT_WAIT_IMAGES
+    context.user_data["edit_images"] = []
+    context.user_data["edit_prompt"] = None
 
-    imgs = context.user_data.get("edit_images", [])
-    imgs.append(file_id)
-    context.user_data["edit_images"] = imgs
-
-    await update.message.reply_text(
-        f"✅ عکس دریافت شد. تعداد عکس‌ها: {len(imgs)}\n"
-        "اگر عکس دیگه‌ای داری بفرست. اگر نه، ✅ تایید عکس‌ها رو بزن.",
+    max_images = settings.MAX_IMAGES
+    await update.effective_message.reply_text(
+        f"📸 عکس(ها) رو بفرست (می‌تونی چندتا بفرستی، حداکثر {max_images} تا).\n"
+        f"بعدش روی «✅ تایید عکس‌ها» بزن.",
         reply_markup=edit_images_kb(),
     )
     return States.EDIT_WAIT_IMAGES
 
 
-# -------------------------
-# Edit flow: receive prompt
-# -------------------------
-async def edit_receive_prompt(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    prompt = (update.message.text or "").strip()
-    if not prompt:
-        await update.message.reply_text("پرامپت خالیه. دوباره بفرست.", reply_markup=edit_prompt_kb())
+async def edit_wait_images(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await ensure_user(update)
+
+    if await is_banned(update):
+        await update.effective_message.reply_text("⛔️ دسترسی شما مسدود شده.")
+        return States.HOME
+
+    if not await check_cooldown(update, context):
+        return States.EDIT_WAIT_IMAGES
+
+    file_id = _get_photo_file_id(update)
+    if not file_id:
+        await update.effective_message.reply_text("فقط عکس بفرست (photo یا document تصویر).", reply_markup=edit_images_kb())
+        return States.EDIT_WAIT_IMAGES
+
+    images: list[str] = context.user_data.get("edit_images", [])
+    if len(images) >= settings.MAX_IMAGES:
+        await update.effective_message.reply_text(
+            f"🚫 بیشتر از {settings.MAX_IMAGES} تا نمی‌شه.\n"
+            "روی «✅ تایید عکس‌ها» بزن یا «🗑 پاک کردن عکس‌ها».",
+            reply_markup=edit_images_kb(),
+        )
+        return States.EDIT_WAIT_IMAGES
+
+    images.append(file_id)
+    context.user_data["edit_images"] = images
+
+    await update.effective_message.reply_text(
+        f"✅ عکس ثبت شد. ({len(images)}/{settings.MAX_IMAGES})\n"
+        "می‌تونی عکس دیگه هم بفرستی یا تایید کنی.",
+        reply_markup=edit_images_kb(),
+    )
+    return States.EDIT_WAIT_IMAGES
+
+
+async def edit_wait_prompt(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await ensure_user(update)
+
+    if await is_banned(update):
+        await update.effective_message.reply_text("⛔️ دسترسی شما مسدود شده.")
+        return States.HOME
+
+    if not await check_cooldown(update, context):
         return States.EDIT_WAIT_PROMPT
 
-    # اگر کاربر "ok" نوشت و تمپلیت انتخاب شده داشت، یعنی فقط همون تمپلیت
-    if prompt.lower() == "ok" and context.user_data.get("selected_template_id"):
-        prompt = "OK"
+    prompt = (update.effective_message.text or "").strip()
+    if not prompt:
+        await update.effective_message.reply_text("پرامپت خالیه. دوباره بفرست:", reply_markup=edit_prompt_kb())
+        return States.EDIT_WAIT_PROMPT
 
     context.user_data["edit_prompt"] = prompt
 
-    await update.message.reply_text(
-        f"🧾 پرامپت ثبت شد:\n{prompt}\n\nحالا 🚀 شروع پردازش رو بزن.",
+    await update.effective_message.reply_text(
+        "✅ پرامپت ثبت شد.\nحالا تایید نهایی:",
         reply_markup=edit_final_confirm_kb(),
     )
     return States.EDIT_CONFIRM
+
+
+# -------------------------
+# Admin: /admin
+# -------------------------
+async def admin_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.effective_user or not _is_admin(update.effective_user.id):
+        await update.effective_message.reply_text("ادمین نیستی.")
+        return
+    await update.effective_message.reply_text("پنل ادمین:", reply_markup=admin_kb())
 
 
 # -------------------------
@@ -169,99 +259,55 @@ async def edit_receive_prompt(update: Update, context: ContextTypes.DEFAULT_TYPE
 # -------------------------
 async def callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
+    if not q:
+        return States.HOME
+
     await q.answer()
     data = q.data or ""
 
-    # =========================
-    # EDIT FLOW callbacks
-    # =========================
-    if data == "edit:cancel":
-        context.user_data.pop("edit_images", None)
-        context.user_data.pop("edit_prompt", None)
-        await q.message.reply_text("لغو شد. برگشتیم منو.", reply_markup=HOME_KB)
+    # ---- ACCOUNT callbacks ----
+    if data == "acc:back":
+        await q.message.reply_text("برگشتیم منو.", reply_markup=HOME_KB)
         return States.HOME
 
-    if data == "edit:images:clear":
-        context.user_data["edit_images"] = []
-        await q.message.reply_text("🗑 عکس‌ها پاک شد. دوباره عکس بفرست.", reply_markup=edit_images_kb())
-        return States.EDIT_WAIT_IMAGES
-
-    if data == "edit:images:confirm":
-        imgs = context.user_data.get("edit_images", [])
-        if not imgs:
-            await q.message.reply_text("هنوز عکسی نفرستادی. اول عکس بفرست.", reply_markup=edit_images_kb())
-            return States.EDIT_WAIT_IMAGES
-
-        selected_tpl = context.user_data.get("selected_template_id")
-        if selected_tpl:
-            await q.message.reply_text(
-                "✍️ پرامپت رو بفرست.\n"
-                "اگر می‌خوای فقط از تمپلیت استفاده کنی، بنویس: ok",
-                reply_markup=edit_prompt_kb(),
-            )
-        else:
-            await q.message.reply_text(
-                "✍️ پرامپت رو بفرست.\n"
-                "اگر دوست داری از تمپلیت استفاده کنی، اول از بخش 🎨 تمپلیت‌ها یکی انتخاب کن.",
-                reply_markup=edit_prompt_kb(),
-            )
-        return States.EDIT_WAIT_PROMPT
-
-    if data == "edit:prompt:confirm":
-        await q.message.reply_text("پرامپت رو به صورت متن ارسال کن.")
-        return States.EDIT_WAIT_PROMPT
-
-    if data == "edit:go":
-        imgs = context.user_data.get("edit_images", [])
-        user_prompt = (context.user_data.get("edit_prompt") or "").strip()
-
-        if not imgs:
-            await q.message.reply_text("عکس‌ها خالیه. دوباره شروع کن.", reply_markup=HOME_KB)
-            return States.HOME
-
-        template_id = context.user_data.get("selected_template_id")
-        final_prompt = user_prompt
-
-        if template_id:
-            async with get_session() as session:
-                tpl = await repo.get_template(session, int(template_id))
-            if tpl:
-                if user_prompt.upper() == "OK":
-                    final_prompt = tpl.prompt
-                else:
-                    final_prompt = f"{tpl.prompt}\n\nUser instructions:\n{user_prompt}"
-
-        if not final_prompt.strip():
-            await q.message.reply_text("پرامپت ثبت نشده. دوباره بفرست.", reply_markup=HOME_KB)
-            return States.HOME
-
-        # ثبت درخواست
+    if data == "acc:history":
         u = update.effective_user
+        if not u:
+            return States.HOME
+
         async with get_session() as session:
-            await repo.create_request(
-                session,
-                user_tg_id=u.id,
-                model=settings.GEMINI_MODEL,
-                images_count=len(imgs),
-                prompt=final_prompt,
-            )
-            await session.commit()
+            rows = await repo.list_recent_requests_for_user(session, u.id, limit=5)
 
-        await consume_edit(update)
+        if not rows:
+            await q.message.reply_text("فعلاً هیچ درخواستی ثبت نکردی.", reply_markup=HOME_KB)
+            return States.HOME
 
-        context.user_data.pop("edit_images", None)
-        context.user_data.pop("edit_prompt", None)
+        lines = []
+        for r in rows:
+            lines.append(f"#{r.id} | {r.status} | {r.images_count} عکس | مدل: {r.model}")
 
-        await q.message.reply_text(
-            "✅ درخواست ثبت شد و رفت تو صف پردازش.\n"
-            "مرحله بعد: صف و Worker واقعی + خروجی تصویر.",
-            reply_markup=HOME_KB,
-        )
+        await q.message.reply_text("🧾 5 درخواست آخر:\n" + "\n".join(lines), reply_markup=HOME_KB)
         return States.HOME
 
-    # =========================
-    # USER template callbacks
-    # =========================
+    if data == "acc:lang:toggle":
+        u = update.effective_user
+        if not u:
+            return States.HOME
+
+        async with get_session() as session:
+            user = await repo.get_user_by_tg(session, u.id)
+            if not user:
+                await q.message.reply_text("مشکل کاربر. دوباره /start بزن.")
+                return States.HOME
+            cur = (user.lang or "fa").lower()
+            user.lang = "en" if cur == "fa" else "fa"
+            await session.commit()
+            new_lang = user.lang
+
+        await q.message.reply_text(f"✅ زبان تغییر کرد: {new_lang}", reply_markup=HOME_KB)
+        return States.HOME
+
+    # ---- USER template callbacks ----
     if data == "tpl:back":
         await q.message.reply_text("برگشتیم منو.", reply_markup=HOME_KB)
         return States.HOME
@@ -304,9 +350,87 @@ async def callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await q.message.reply_text("✅ تمپلیت انتخاب شد.", reply_markup=HOME_KB)
         return States.HOME
 
-    # =========================
-    # ADMIN callbacks
-    # =========================
+    # ---- EDIT callbacks ----
+    if data == "edit:cancel":
+        context.user_data.pop("edit_images", None)
+        context.user_data.pop("edit_prompt", None)
+        await q.message.reply_text("لغو شد. برگشتیم منو.", reply_markup=HOME_KB)
+        return States.HOME
+
+    if data == "edit:images:clear":
+        context.user_data["edit_images"] = []
+        await q.message.reply_text("🗑 عکس‌ها پاک شد. دوباره عکس‌ها رو بفرست.", reply_markup=edit_images_kb())
+        return States.EDIT_WAIT_IMAGES
+
+    if data == "edit:images:confirm":
+        images: list[str] = context.user_data.get("edit_images", [])
+        if not images:
+            await q.message.reply_text("اول حداقل یک عکس بفرست.", reply_markup=edit_images_kb())
+            return States.EDIT_WAIT_IMAGES
+
+        await q.message.reply_text(
+            "✍️ حالا پرامپت رو بفرست.\n"
+            "مثال: «پوست رو طبیعی‌تر کن، نور نرم‌تر، پس‌زمینه ساده»",
+            reply_markup=edit_prompt_kb(),
+        )
+        return States.EDIT_WAIT_PROMPT
+
+    if data == "edit:go":
+        fake_update = Update(update.update_id, message=q.message)
+        fake_update._effective_user = update.effective_user
+
+        if not await check_force_join(fake_update, context):
+            return States.HOME
+
+        if not await check_daily_quota(fake_update):
+            return States.HOME
+
+        u = update.effective_user
+        if not u:
+            await q.message.reply_text("مشکل کاربر. دوباره /start بزن.")
+            return States.HOME
+
+        images: list[str] = context.user_data.get("edit_images", [])
+        prompt: str | None = context.user_data.get("edit_prompt")
+        if not images or not prompt:
+            await q.message.reply_text("اطلاعات ناقصه. دوباره از اول برو.", reply_markup=HOME_KB)
+            return States.HOME
+
+        selected_template_id = context.user_data.get("selected_template_id")
+        final_prompt = prompt
+        if selected_template_id:
+            async with get_session() as session:
+                tpl = await repo.get_template(session, int(selected_template_id))
+            if tpl and tpl.prompt:
+                final_prompt = f"{tpl.prompt}\n\nUser prompt: {prompt}"
+
+        async with get_session() as session:
+            req = await repo.create_request(
+                session,
+                user_tg_id=u.id,
+                model=settings.GEMINI_MODEL,
+                images_count=len(images),
+                prompt=final_prompt,
+            )
+            await session.commit()
+
+        await consume_edit(fake_update)
+
+        await enqueue_request(
+            request_id=req.id,
+            user_tg_id=u.id,
+            chat_id=q.message.chat_id,
+            image_file_ids=images,
+            prompt=final_prompt,
+        )
+
+        context.user_data.pop("edit_images", None)
+        context.user_data.pop("edit_prompt", None)
+
+        await q.message.reply_text("🚀 درخواست ثبت شد و رفت تو صف پردازش. نتیجه که آماده بشه می‌فرستم.", reply_markup=HOME_KB)
+        return States.HOME
+
+    # ---- ADMIN callbacks (فعلاً همون قبلی‌ها) ----
     if data.startswith("adm:"):
         if not update.effective_user or not _is_admin(update.effective_user.id):
             await q.message.reply_text("ادمین نیستی.")
@@ -348,7 +472,11 @@ async def callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 f"Prompt:\n{tpl.prompt}"
             )
             if tpl.sample_file_id:
-                await q.message.reply_photo(photo=tpl.sample_file_id, caption=text, reply_markup=admin_template_actions_kb(tpl.id, tpl.is_active))
+                await q.message.reply_photo(
+                    photo=tpl.sample_file_id,
+                    caption=text,
+                    reply_markup=admin_template_actions_kb(tpl.id, tpl.is_active),
+                )
             else:
                 await q.message.reply_text(text, reply_markup=admin_template_actions_kb(tpl.id, tpl.is_active))
             return States.HOME
@@ -376,55 +504,55 @@ async def callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # Admin Wizard Steps
 # -------------------------
 async def adm_tpl_title(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    title = (update.message.text or "").strip()
+    title = (update.effective_message.text or "").strip()
     if not title:
-        await update.message.reply_text("اسم خالیه. دوباره بفرست.")
+        await update.effective_message.reply_text("اسم خالیه. دوباره بفرست.")
         return States.ADM_TPL_TITLE
 
     async with get_session() as session:
         exists = await repo.title_exists(session, title)
     if exists:
-        await update.message.reply_text("این اسم قبلاً استفاده شده. یه اسم دیگه بده:")
+        await update.effective_message.reply_text("این اسم قبلاً استفاده شده. یه اسم دیگه بده:")
         return States.ADM_TPL_TITLE
 
     context.user_data["adm_new_tpl"]["title"] = title
-    await update.message.reply_text("توضیح تمپلیت رو بفرست:")
+    await update.effective_message.reply_text("توضیح تمپلیت رو بفرست:")
     return States.ADM_TPL_DESC
 
 
 async def adm_tpl_desc(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    desc = (update.message.text or "").strip()
+    desc = (update.effective_message.text or "").strip()
     if not desc:
-        await update.message.reply_text("توضیح خالیه. دوباره بفرست.")
+        await update.effective_message.reply_text("توضیح خالیه. دوباره بفرست.")
         return States.ADM_TPL_DESC
 
     context.user_data["adm_new_tpl"]["description"] = desc
-    await update.message.reply_text("Prompt پایه رو بفرست:")
+    await update.effective_message.reply_text("Prompt پایه رو بفرست:")
     return States.ADM_TPL_PROMPT
 
 
 async def adm_tpl_prompt(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    prompt = (update.message.text or "").strip()
+    prompt = (update.effective_message.text or "").strip()
     if not prompt:
-        await update.message.reply_text("Prompt خالیه. دوباره بفرست.")
+        await update.effective_message.reply_text("Prompt خالیه. دوباره بفرست.")
         return States.ADM_TPL_PROMPT
 
     context.user_data["adm_new_tpl"]["prompt"] = prompt
-    await update.message.reply_text("حالا یک عکس نمونه بفرست (یا بنویس: skip)")
+    await update.effective_message.reply_text("حالا یک عکس نمونه بفرست (یا بنویس: skip)")
     return States.ADM_TPL_SAMPLE
 
 
 async def adm_tpl_sample(update: Update, context: ContextTypes.DEFAULT_TYPE):
     sample_file_id = None
 
-    if update.message.text and update.message.text.strip().lower() == "skip":
+    if update.effective_message.text and update.effective_message.text.strip().lower() == "skip":
         sample_file_id = None
-    elif update.message.photo:
-        sample_file_id = update.message.photo[-1].file_id
-    elif update.message.document and (update.message.document.mime_type or "").startswith("image/"):
-        sample_file_id = update.message.document.file_id
+    elif getattr(update.effective_message, "photo", None):
+        sample_file_id = update.effective_message.photo[-1].file_id
+    elif getattr(update.effective_message, "document", None) and (update.effective_message.document.mime_type or "").startswith("image/"):
+        sample_file_id = update.effective_message.document.file_id
     else:
-        await update.message.reply_text("یا عکس بفرست یا بنویس: skip")
+        await update.effective_message.reply_text("یا عکس بفرست یا بنویس: skip")
         return States.ADM_TPL_SAMPLE
 
     data = context.user_data.get("adm_new_tpl", {})
@@ -433,9 +561,15 @@ async def adm_tpl_sample(update: Update, context: ContextTypes.DEFAULT_TYPE):
     prompt = data.get("prompt")
 
     async with get_session() as session:
-        await repo.create_template(session, title=title, description=description, prompt=prompt, sample_file_id=sample_file_id)
+        await repo.create_template(
+            session,
+            title=title,
+            description=description,
+            prompt=prompt,
+            sample_file_id=sample_file_id,
+        )
         await session.commit()
 
     context.user_data.pop("adm_new_tpl", None)
-    await update.message.reply_text("✅ تمپلیت اضافه شد.", reply_markup=HOME_KB)
+    await update.effective_message.reply_text("✅ تمپلیت اضافه شد.", reply_markup=HOME_KB)
     return States.HOME
